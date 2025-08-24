@@ -17,16 +17,19 @@ public partial class DB_Sychronizer : Node
 
 	[Export(PropertyHint.Range, "0,5")]
 	public float syncInterval = 0.1f; // Sync every 0.1s
+	[Export(PropertyHint.Range, "0,5")]
+	public float replicateInterval = 0.1f;
 	[Export]
 	public SyncMode syncMode = SyncMode.Process; // Selectable in inspector
 	[Export]
-	public Godot.Collections.Dictionary<Node, string[]> syncNodes = new Godot.Collections.Dictionary<Node, string[]>();
+	public Godot.Collections.Dictionary<NodePath, string[]> syncNodes = new Godot.Collections.Dictionary<NodePath, string[]>();
 		
 	private ConcurrentDictionary<string, Variant> lastSynced = new ConcurrentDictionary<string, Variant>();
 
 	private DB_Client client;
 	private string playerId;
-	private float timeAccumulator = 0f;
+	private float syncTimeAccumulator = 0f;
+	private float replicateTimeAccumulator = 0f;
 
 	public override async void _Ready()
 	{
@@ -34,7 +37,7 @@ public partial class DB_Sychronizer : Node
 		{
 			client = GetNode<DB_Client>("/root/DbClient");
 			playerId = client.playerId;
-			await client.Subscribe($"sync:{playerId}", OnRemoteUpdate);
+			//await client.Subscribe($"sync:{playerId}", OnRemoteUpdate);
 		}
 		catch (System.Exception)
 		{
@@ -46,29 +49,41 @@ public partial class DB_Sychronizer : Node
 	{
 		if (syncMode != SyncMode.Process)
 			return;
-			
-		Step((float)delta);
+		
+		SyncStep((float)delta);
+		ReplicateStep((float) delta);
 	}
 
 	public override void _PhysicsProcess(double delta)
 	{
 		if (syncMode != SyncMode.PhysicsProcess)
 			return;
-			
-		Step((float)delta);
+		
+		SyncStep((float)delta);
+		ReplicateStep((float) delta);
 	}
 	
 	public override void _ExitTree()
 	{
 		client.KeyDelete($"player:{playerId}:data");
 	}
-
-	private void Step(float delta)
+	
+	private void ReplicateStep(float delta)
 	{
-		timeAccumulator += delta;
-		if (timeAccumulator >= syncInterval)
+		replicateTimeAccumulator += delta;
+		if (replicateTimeAccumulator >= replicateInterval)
 		{
-			timeAccumulator = 0f;
+			replicateTimeAccumulator = 0f;
+			ReplicateProperties();
+		}
+	}
+
+	private void SyncStep(float delta)
+	{
+		syncTimeAccumulator += delta;
+		if (syncTimeAccumulator >= syncInterval)
+		{
+			syncTimeAccumulator = 0f;
 			SyncLocalProperties();
 		}
 	}
@@ -77,13 +92,12 @@ public partial class DB_Sychronizer : Node
 	{
 		foreach (var kv in syncNodes)
 		{
-			Node node = kv.Key;
-
+			Node node = GetNode(kv.Key);
 			foreach (string prop in kv.Value)
 			{
 				if (!node.HasMethod("get")) continue; 
 				Variant value = node.Get(prop);
-				string key = $"{node.Name}:{prop}";
+				string key = $"{kv.Key}:{prop}";
 				string strValue = value.ToString();
 				if (!lastSynced.TryGetValue(key, out Variant oldValue) || oldValue.ToString() != strValue)
 				{
@@ -93,6 +107,33 @@ public partial class DB_Sychronizer : Node
 			}
 		}
 		client.SetExpireTime($"player:{playerId}:data", 10);
+	}
+	
+	private async void ReplicateProperties()
+	{
+		HashEntry[] data = await client.HashGetAll($"player:{playerId}:data");
+		
+		foreach (var entry in data)
+		{
+			string key = entry.Name;
+			string val = entry.Value;
+			
+			GD.Print(entry);
+			// Key format: "NodePath:Property"
+			var parts = key.Split(':');
+			if (parts.Length < 2) continue;
+
+			string path = parts[0];
+			string prop = parts[1];
+
+			if (!HasNode(path)) continue;
+
+			Node node = GetNode(path);
+			//if (!node.Get(prop)) continue;
+
+			// Convert string back to Variant if needed
+			node.Set(prop, val);
+		}
 	}
 
 	private void OnRemoteUpdate(RedisChannel channel, RedisValue message)
